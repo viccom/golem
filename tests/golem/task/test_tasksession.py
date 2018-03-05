@@ -1,6 +1,8 @@
 # pylint: disable=protected-access
 import calendar
 import datetime
+
+import golem_messages
 import os
 import pathlib
 import pickle
@@ -8,7 +10,7 @@ import random
 import time
 import uuid
 from unittest import TestCase
-from unittest.mock import patch, ANY, Mock, MagicMock
+from unittest.mock import patch, ANY, Mock, MagicMock, _SentinelObject
 
 from golem_messages import message
 
@@ -20,6 +22,7 @@ from golem.docker.image import DockerImage
 from golem.model import Actor
 from golem.network import history
 from golem.network.p2p.node import Node
+from golem.network.pending import PendingSessionMessages
 from golem.network.transport.tcpnetwork import BasicProtocol
 from golem.resource.client import ClientOptions
 from golem.task import taskstate
@@ -51,6 +54,11 @@ class TestTaskSessionPep8(testutils.PEP8MixIn, TestCase):
     PEP8_FILES = ['golem/task/tasksession.py', ]
 
 
+extra_serializers = golem_messages.serializer.ENCODERS
+extra_serializers[Mock] = lambda *_: None
+extra_serializers[_SentinelObject] = lambda *_: None
+
+
 class TestTaskSession(LogTestCase, testutils.TempDirFixture):
     def setUp(self):
         super(TestTaskSession, self).setUp()
@@ -58,7 +66,7 @@ class TestTaskSession(LogTestCase, testutils.TempDirFixture):
         self.task_session = TaskSession(Mock())
 
     @patch('golem.task.tasksession.TaskSession.send')
-    def test_hello(self, send_mock):
+    def test_hello(self, send_mock, *_):
         self.task_session.conn.server.get_key_id.return_value = key_id = \
             'key id%d' % (random.random() * 1000,)
         self.task_session.send_hello()
@@ -231,13 +239,18 @@ class TestTaskSession(LogTestCase, testutils.TempDirFixture):
         ts._react_to_hello(msg)
         self.assertTrue(ts.send.called)
 
-    @patch('golem.task.tasksession.get_task_message', Mock())
-    def test_result_received(self):
+    @patch.dict('golem_messages.serializer.ENCODERS', extra_serializers)
+    @patch('golem.task.tasksession.get_task_message',
+           return_value=message.ReportComputedTask())
+    def test_result_received(self, *_):
+        pending_messages = PendingSessionMessages(db_dir=self.tempdir)
+
         conn = Mock()
         ts = TaskSession(conn)
-        ts.task_server = Mock()
+        ts.task_server = Mock(pending_messages=pending_messages)
         ts.task_manager = Mock()
         ts.task_manager.verify_subtask.return_value = True
+        ts.key_id = "key_id"
         subtask_id = "xxyyzz"
 
         def finished():
@@ -262,36 +275,38 @@ class TestTaskSession(LogTestCase, testutils.TempDirFixture):
 
         ts.result_received(extra_data, decrypt=False)
 
-        self.assertTrue(ts.msgs_to_send)
-        self.assertIsInstance(ts.msgs_to_send[0],
-                              message.tasks.SubtaskResultsRejected)
-        self.assertTrue(conn.close.called)
+        pending_message = next(pending_messages.get(node_id=ts.key_id))
+        assert pending_message.type == message.tasks.SubtaskResultsRejected.TYPE
+        assert conn.close.called
+        pending_message.delete_instance()
 
         extra_data.update(dict(
             result_type=ResultType.DATA,
         ))
         conn.close.called = False
-        ts.msgs_to_send = []
 
         ts.task_manager.computed_task_received = Mock(
             side_effect=finished(),
         )
         ts.result_received(extra_data, decrypt=False)
 
-        assert ts.msgs_to_send
-        assert isinstance(ts.msgs_to_send[0],
-                          message.tasks.SubtaskResultsAccepted)
+        pending_message = next(pending_messages.get(node_id=ts.key_id))
+        assert pending_message.type == message.tasks.SubtaskResultsAccepted.TYPE
         assert conn.close.called
+        pending_message.delete_instance()
 
         extra_data.update(dict(
             subtask_id=None,
         ))
         conn.close.called = False
-        ts.msgs_to_send = []
-
         ts.result_received(extra_data, decrypt=False)
 
-        assert not ts.msgs_to_send
+        try:
+            pending_message = next(pending_messages.get(node_id=ts.key_id))
+        except StopIteration:
+            pending_message = None
+
+        assert pending_message is None
         assert conn.close.called
 
     def test_result_rejected(self):
