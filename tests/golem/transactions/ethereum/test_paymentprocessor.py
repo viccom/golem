@@ -436,7 +436,8 @@ class InteractionWithSmartContractInterfaceTest(DatabaseFixture):
         self.sci.request_gnt_from_faucet.assert_called_once()
 
     @freeze_time(timestamp_to_datetime(0))
-    def test_batch_transfer(self):
+    def \
+            est_batch_transfer(self):
         self.pp.deadline = 0
         self.pp.CLOSURE_TIME_DELAY = 0
         self.assertFalse(self.pp.sendout())
