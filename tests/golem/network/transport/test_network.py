@@ -28,7 +28,7 @@ class ASession(object):
         self.my_private_key = my_keys.raw_privkey
         self.theirs_public_key = their_keys.raw_pubkey
 
-    def dropped(self):
+    def dropped(self, reason=None):
         self.dropped_called = True
 
     def interpret(self, msg):
