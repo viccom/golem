@@ -1,4 +1,5 @@
 # pylint: disable=protected-access
+# pylint: disable=too-many-lines
 import calendar
 import datetime
 
@@ -13,8 +14,10 @@ from unittest import TestCase
 from unittest.mock import patch, ANY, Mock, MagicMock, _SentinelObject
 
 from golem_messages import message
+from peewee import PeeweeException
 
 from golem import model, testutils
+from golem.clientconfigdescriptor import ClientConfigDescriptor
 from golem.core.databuffer import DataBuffer
 from golem.core.variables import PROTOCOL_CONST
 from golem.docker.environment import DockerEnvironment
@@ -28,7 +31,9 @@ from golem.resource.client import ClientOptions
 from golem.task import taskstate
 from golem.task.taskbase import ResultType, TaskHeader
 from golem.task.taskkeeper import CompTaskKeeper
+from golem.task.taskserver import WaitingTaskResult, TaskServer
 from golem.task.tasksession import TaskSession, logger, get_task_message
+from golem.testutils import TempDirFixture
 from golem.tools.assertlogs import LogTestCase
 from tests import factories
 from tests.factories.taskserver import WaitingTaskResultFactory
@@ -239,7 +244,7 @@ class TestTaskSession(LogTestCase, testutils.TempDirFixture):
         ts._react_to_hello(msg)
         self.assertTrue(ts.send.called)
 
-    @patch.dict('golem_messages.serializer.ENCODERS', extra_serializers)
+    @patch('golem_messages.serializer.ENCODERS', extra_serializers)
     @patch('golem.task.tasksession.get_task_message',
            return_value=message.ReportComputedTask())
     def test_result_received(self, *_):
@@ -902,3 +907,84 @@ class ReportComputedTaskTest(LogTestCase):
             stm.call_args[0][1],
             message.concents.ForceGetTaskResult
         )
+
+
+@patch('golem.task.taskmanager.TaskManager')
+@patch('golem.task.taskcomputer.TaskComputer')
+@patch('golem.task.taskkeeper.TaskHeaderKeeper')
+@patch('twisted.internet.reactor', create=True)
+class PendingMessagesTest(TempDirFixture):
+
+    def setUp(self):
+        from golem.transactions.ethereum.ethereumpaymentskeeper import \
+            EthereumAddress, EthAccountInfo
+
+        super().setUp()
+
+        self.client = Mock(datadir=self.tempdir)
+        self.task_server = TaskServer(Node(), ClientConfigDescriptor(),
+                                      self.client, use_docker_manager=False)
+
+        self.connection = Mock(server=self.task_server)
+        self.task_session = TaskSession(self.connection)
+        self.task_session.key_id = 'abcd0123'
+        self.task_session.address = '10.0.0.10'
+        self.task_session.port = 10000
+        self.task_session.result_owner = EthAccountInfo(
+            self.task_session.key_id,
+            self.task_session.port,
+            self.task_session.address,
+            'node_name',
+            node_info=dict(),
+            eth_account=EthereumAddress('0x' + '0' * 32)
+        )
+
+    def tearDown(self):
+        self.task_server.pending_messages._database.close()
+
+    def test_no_messages_to_restore(self, reactor, *_):
+        self.task_session._restore_messages()
+        assert not reactor.callLater.called
+
+    def test_storage_error(self, reactor, *_):
+        pending_messages = self.task_server.pending_messages
+        pending_messages.put(self.task_session.key_id,
+                             factories.messages.ReportComputedTask())
+
+        assert pending_messages.exists(self.task_session.key_id)
+
+        get_pending = Mock(side_effect=PeeweeException())
+        self.task_server.pending_messages.get = get_pending
+        self.task_session._restore_messages()
+
+        assert pending_messages.exists(self.task_session.key_id)
+        assert not reactor.callLater.called
+
+    def test_partial_restore_messages(self, reactor, *_):
+        pending_messages = self.task_server.pending_messages
+        pending_messages.put(self.task_session.key_id,
+                             factories.messages.ReportComputedTask())
+
+        slots = [('slot_1', 'value_1'), ('slot_2', 'value_2')]
+        msg = Mock(TYPE=1234567890, slots=lambda *_: slots)
+        pending_messages.put(self.task_session.key_id, msg)
+
+        saved_messages = list(pending_messages.get(self.task_session.key_id))
+        assert len(saved_messages) == 2
+
+        self.task_session._restore_messages()
+        assert reactor.callLater.call_count == 1
+        assert not pending_messages.exists(self.task_session.key_id)
+
+    @patch('golem.network.pending.PendingTaskSession.update_session')
+    def test_no_session_state_to_restore(self, update_session, *_):
+        self.task_session._restore_session_state()
+        assert not update_session.called
+
+    @patch('golem.network.pending.PendingTaskSession.update_session')
+    def test_restore_session(self, update_session, *_):
+        pending_messages = self.task_server.pending_messages
+        pending_messages.put_session(self.task_session)
+
+        self.task_session._restore_session_state()
+        assert update_session.called

@@ -1,15 +1,16 @@
 import datetime
+import json
 from typing import List, Iterator, Optional, Tuple
 
 import operator
 from functools import reduce
-from golem_messages import serializer
+
+from golem_messages import message, serializer  # noqa
 from peewee import CharField, IntegerField, TextField, BlobField
 
+from golem.core.simpleserializer import DictSerializer
 from golem.database import GolemSqliteDatabase, Database
-from golem.model import JsonField, BaseModel, collect_db_models, \
-    collect_db_fields
-from golem.transactions.ethereum.ethereumpaymentskeeper import EthAccountInfo
+from golem.model import BaseModel, collect_db_models, collect_db_fields
 
 ANY = object()
 db = GolemSqliteDatabase(
@@ -24,15 +25,13 @@ db = GolemSqliteDatabase(
 
 # Fields
 
-class ResultOwnerField(JsonField):
+class ResultOwnerField(TextField):
 
     def db_value(self, value):
-        dictionary = value.__dict__ if value else None
-        return super().db_value(dictionary)
+        return json.dumps(DictSerializer.dump(value))
 
     def python_value(self, value):
-        dictionary = super().python_value(value)
-        return EthAccountInfo(**dictionary)
+        return DictSerializer.load(json.loads(value))
 
 
 class MessageSlotsField(BlobField):
@@ -52,10 +51,10 @@ class MessageSlotsField(BlobField):
 
 # Models
 
-class PendingObjectModel(BaseModel):
+class PendingObjectModel(BaseModel):  # pylint: disable=too-few-public-methods
     """ Base class for pending message and session models"""
 
-    class Meta:
+    class Meta:  # pylint: disable=too-few-public-methods
         database = db
 
     node_id = CharField(index=True)  # Receiving node
@@ -84,12 +83,16 @@ class PendingObjectModel(BaseModel):
 
 class PendingTaskSession(PendingObjectModel):
 
+    address = CharField(null=True)
+    port = IntegerField(null=True)
     result_owner = ResultOwnerField(null=True)
     err_msg = TextField(null=True)
 
     @classmethod
-    def from_session(cls, session: 'TaskSession') -> 'PendingTaskSession':
+    def from_session(cls, session) -> 'PendingTaskSession':
         return cls(
+            address=session.address,
+            port=session.port,
             node_id=session.key_id,
             task_id=session.task_id,
             subtask_id=session.subtask_id,
@@ -97,7 +100,7 @@ class PendingTaskSession(PendingObjectModel):
             err_msg=session.err_msg
         )
 
-    def update_session(self, session: 'TaskSession') -> None:
+    def update_session(self, session) -> None:
         session.task_id = self.task_id
         session.subtask_id = self.subtask_id
         session.result_owner = self.result_owner
@@ -117,7 +120,7 @@ class PendingMessagesMixin:
     @classmethod
     def put(cls,
             node_id: str,
-            msg: 'Message',
+            msg: 'message.base.Message',
             task_id: Optional[str] = None,
             subtask_id: Optional[str] = None) -> None:
 
@@ -157,25 +160,24 @@ class PendingMessagesMixin:
 class PendingTaskSessionsMixin:
 
     @classmethod
-    def put_session(cls, session: 'TaskSession') -> None:
+    def put_session(cls, session) -> None:
         PendingTaskSession.from_session(session).save(force_insert=True)
 
     @classmethod
     def get_session(cls,
                     node_id: str,
                     task_id: Optional[object] = ANY,
-                    subtask_id: Optional[object] = ANY
-                    ) -> PendingTaskSession:
+                    subtask_id: Optional[object] = ANY) -> PendingTaskSession:
 
         clauses = PendingTaskSession.build_select_clauses(node_id, task_id,
                                                           subtask_id)
         return PendingTaskSession.get(clauses)
 
     @classmethod
-    def exists(cls,
-               node_id: str,
-               task_id: Optional[object] = ANY,
-               subtask_id: Optional[object] = ANY) -> bool:
+    def session_exists(cls,
+                       node_id: str,
+                       task_id: Optional[object] = ANY,
+                       subtask_id: Optional[object] = ANY) -> bool:
 
         clauses = PendingTaskSession.build_select_clauses(node_id, task_id,
                                                           subtask_id)
@@ -195,7 +197,7 @@ class PendingSessionMessages(PendingMessagesMixin,
     def __init__(self,
                  db_dir: str,
                  db_name: str = 'session.db',
-                 schemas_dir: Optional[str] = None):
+                 schemas_dir: Optional[str] = None) -> None:
 
         self._last_sweep_ts = None
         self._fields = DB_FIELDS
