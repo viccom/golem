@@ -37,6 +37,7 @@ from golem.task.tasksession import TaskSession, logger, get_task_message
 from golem.testutils import TempDirFixture
 from golem.tools.assertlogs import LogTestCase
 from tests import factories
+from tests.factories import messages as msg_factories
 from tests.factories.taskserver import WaitingTaskResultFactory
 
 
@@ -65,7 +66,19 @@ extra_serializers[Mock] = lambda *_: None
 extra_serializers[_SentinelObject] = lambda *_: None
 
 
-class TestTaskSession(LogTestCase, testutils.TempDirFixture):
+class ConcentMessageMixin():
+    def assert_concent_cancel(self, mock_call, subtask_id, message_class_name):
+        self.assertEqual(mock_call[0], subtask_id)
+        self.assertEqual(mock_call[1], message_class_name)
+
+    def assert_concent_submit(self, mock_call, subtask_id, message_class):
+        self.assertEqual(mock_call[0], subtask_id)
+        self.assertIsInstance(mock_call[1], message_class)
+
+
+class TestTaskSession(ConcentMessageMixin, LogTestCase,
+                      testutils.TempDirFixture):
+
     def setUp(self):
         super(TestTaskSession, self).setUp()
         random.seed()
@@ -183,7 +196,7 @@ class TestTaskSession(LogTestCase, testutils.TempDirFixture):
         ts.send_report_computed_task(
             wtr, wtr.owner_address, wtr.owner_port, "0x00", wtr.owner)
 
-        rct = ts.conn.send_message.call_args[0][0]
+        rct: message.ReportComputedTask = ts.conn.send_message.call_args[0][0]
         self.assertIsInstance(rct, message.ReportComputedTask)
         self.assertEqual(rct.subtask_id, wtr.subtask_id)
         self.assertEqual(rct.result_type, ResultType.DATA)
@@ -212,7 +225,11 @@ class TestTaskSession(LogTestCase, testutils.TempDirFixture):
         ts2.task_manager.get_node_id_for_subtask.return_value = "DEF"
         get_mock.side_effect = history.MessageNotFound
 
-        ts2.interpret(rct)
+        with patch(
+                'golem.network.concent.helpers'
+                '.process_report_computed_task',
+                return_value=msg_factories.AckReportComputedTask()):
+            ts2.interpret(rct)
         ts2.task_server.receive_subtask_computation_time.assert_called_with(
             wtr.subtask_id, wtr.computing_time)
         wtr.result_type = "UNKNOWN"
@@ -542,37 +559,44 @@ class TestTaskSession(LogTestCase, testutils.TempDirFixture):
 
     def test_react_to_ack_reject_report_computed_task(self):
         task_keeper = CompTaskKeeper(pathlib.Path(self.path))
+        subtask_id = '1337'
+        task_id = '42'
 
         session = self.task_session
         session.concent_service = MagicMock()
         session.task_manager.comp_task_keeper = task_keeper
         session.key_id = 'owner_id'
 
+        cancel = session.concent_service.cancel_task_message
+
         msg_ack = message.AckReportComputedTask(
-            subtask_id='subtask_id',
+            subtask_id=subtask_id
         )
         msg_rej = message.RejectReportComputedTask(
-            subtask_id='subtask_id',
+            subtask_id=subtask_id,
         )
 
         # Subtask is not known
         session._react_to_ack_report_computed_task(msg_ack)
-        assert not session.concent_service.cancel.called
+        self.assertFalse(cancel.called)
         session._react_to_reject_report_computed_task(msg_rej)
-        assert not session.concent_service.cancel.called
+        self.assertFalse(cancel.called)
 
         # Save subtask information
         task = Mock(header=Mock(task_owner_key_id='owner_id'))
-        task_keeper.subtask_to_task['subtask_id'] = 'task_id'
-        task_keeper.active_tasks['task_id'] = task
+        task_keeper.subtask_to_task[subtask_id] = task_id
+        task_keeper.active_tasks[task_id] = task
 
         # Subtask is known
         session._react_to_ack_report_computed_task(msg_ack)
-        assert session.concent_service.cancel.called
+        self.assertTrue(cancel.called)
+        self.assert_concent_cancel(
+            cancel.call_args[0], subtask_id, 'ForceReportComputedTask')
 
-        session.concent_service.cancel.reset_mock()
+        cancel.reset_mock()
         session._react_to_reject_report_computed_task(msg_ack)
-        assert session.concent_service.cancel.called
+        self.assert_concent_cancel(
+            cancel.call_args[0], subtask_id, 'ForceReportComputedTask')
 
     def test_react_to_resource_list(self):
         task_server = self.task_session.task_server
@@ -824,7 +848,7 @@ class SubtaskResultsAcceptedTest(TestCase):
         self.assertIsInstance(sra.task_to_compute, message.tasks.TaskToCompute)
 
 
-class ReportComputedTaskTest(LogTestCase):
+class ReportComputedTaskTest(ConcentMessageMixin, LogTestCase):
 
     @staticmethod
     def _create_pull_package(result):
@@ -857,6 +881,7 @@ class ReportComputedTaskTest(LogTestCase):
                 self.subtask_id: Mock(deadline=calendar.timegm(time.gmtime()))
             })
         }
+        ts.task_server.task_keeper.task_headers = {}
         self.ts = ts
 
         gsam = patch('golem.network.concent.helpers.history'
@@ -865,24 +890,28 @@ class ReportComputedTaskTest(LogTestCase):
         gsam.start()
         self.addCleanup(gsam.stop)
 
-    def test_result_received(self):
-        msg = factories.messages.ReportComputedTask(
+    def _prepare_report_computed_task(self, **kwargs):
+        return factories.messages.ReportComputedTask(
             subtask_id=self.subtask_id,
             task_to_compute__compute_task_def__task_id=self.task_id,
+            **kwargs,
         )
 
+    def test_result_received(self):
+        msg = self._prepare_report_computed_task()
         self.ts.task_manager.task_result_manager.pull_package = \
             self._create_pull_package(True)
 
         self.ts._react_to_report_computed_task(msg)
-        assert self.ts.result_received.called
+        self.assertTrue(self.ts.result_received.called)
+
+        cancel = self.ts.concent_service.cancel_task_message
+        self.assert_concent_cancel(
+            cancel.call_args[0], self.subtask_id, 'ForceGetTaskResult')
 
     def test_reject_result_pull_failed_no_concent(self):
-        msg = factories.messages.ReportComputedTask(
-            subtask_id=self.subtask_id,
-            task_to_compute__compute_task_def__task_id=self.task_id,
-            task_to_compute__concent_enabled=False
-        )
+        msg = self._prepare_report_computed_task(
+            task_to_compute__concent_enabled=False)
 
         self.ts.task_manager.task_result_manager.pull_package = \
             self._create_pull_package(False)
@@ -892,22 +921,26 @@ class ReportComputedTaskTest(LogTestCase):
         assert self.ts.task_manager.task_computation_failure.called
 
     def test_reject_result_pull_failed_with_concent(self):
-        msg = factories.messages.ReportComputedTask(
-            subtask_id=self.subtask_id,
-            task_to_compute__compute_task_def__task_id=self.task_id,
-            task_to_compute__concent_enabled=True
-        )
+        msg = self._prepare_report_computed_task(
+            task_to_compute__concent_enabled=True)
 
         self.ts.task_manager.task_result_manager.pull_package = \
             self._create_pull_package(False)
 
         self.ts._react_to_report_computed_task(msg)
         stm = self.ts.concent_service.submit_task_message
-        stm.assert_called_once_with(self.subtask_id, ANY)
-        self.assertIsInstance(
-            stm.call_args[0][1],
-            message.concents.ForceGetTaskResult
-        )
+
+        self.assertEqual(stm.call_count, 2)
+
+        self.assert_concent_submit(stm.call_args_list[0][0], self.subtask_id,
+                                   message.concents.ForceGetTaskResult)
+        self.assert_concent_submit(stm.call_args_list[1][0], self.subtask_id,
+                                   message.concents.ForceGetTaskResult)
+
+        # ensure the first call is delayed
+        self.assertGreater(stm.call_args_list[0][0][2], datetime.timedelta(0))
+        # ensure the second one is not
+        self.assertEqual(len(stm.call_args_list[1][0]), 2)
 
 
 @patch('golem.task.taskmanager.TaskManager')
