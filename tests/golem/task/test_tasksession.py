@@ -3,7 +3,6 @@
 import calendar
 import datetime
 
-import golem_messages
 import os
 import pathlib
 import pickle
@@ -12,6 +11,8 @@ import time
 import uuid
 from unittest import TestCase
 from unittest.mock import patch, ANY, Mock, MagicMock, _SentinelObject
+
+import golem_messages
 
 from golem_messages import message
 from peewee import PeeweeException
@@ -31,7 +32,7 @@ from golem.resource.client import ClientOptions
 from golem.task import taskstate
 from golem.task.taskbase import ResultType, TaskHeader
 from golem.task.taskkeeper import CompTaskKeeper
-from golem.task.taskserver import WaitingTaskResult, TaskServer
+from golem.task.taskserver import TaskServer
 from golem.task.tasksession import TaskSession, logger, get_task_message
 from golem.testutils import TempDirFixture
 from golem.tools.assertlogs import LogTestCase
